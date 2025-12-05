@@ -1,0 +1,24 @@
+{
+  "originHash" : "a8113115259b6e480591b082c35d10b7d14740f1687bfca94acda5587928b0e2",
+  "pins" : [
+    {
+      "identity" : "tiff-ios",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/ngageoint/tiff-ios.git",
+      "state" : {
+        "revision" : "2e019be5231352eef1854492bd25f80174b0f902",
+        "version" : "5.0.0"
+      }
+    },
+    {
+      "identity" : "zipfoundation",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/weichsel/ZIPFoundation",
+      "state" : {
+        "revision" : "22787ffb59de99e5dc1fbfe80b19c97a904ad48d",
+        "version" : "0.9.20"
+      }
+    }
+  ],
+  "version" : 3
+}
