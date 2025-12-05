@@ -131,36 +131,38 @@ fragment float4 particleFragment(ParticleVertexOut in [[stage_in]],
     return in.color;
 }
 
-// Simple Uniforms (giả định)
-struct SimpleUniforms {
-    float4x4 modelViewProjectionMatrix;
-};
-
-// Simple Vertex Input (giả định)
-struct SimpleVertexInput {
+// MARK: For Camera pos
+// Thêm vào Shaders.metal
+struct GeometryVertexIn {
     float3 position [[attribute(0)]];
     float4 color [[attribute(1)]];
 };
 
-// Vertex Output
-struct SimpleVertexOutput {
+struct GeometryVertexOut {
     float4 position [[position]];
     float4 color;
 };
 
-// Vertex Function cho hình học đơn giản
-vertex SimpleVertexOutput simpleVertex(
-    SimpleVertexInput in [[stage_in]],
-    constant SimpleUniforms &uniforms [[buffer(4)]]) {
-    
-    SimpleVertexOutput out;
-    out.position = uniforms.modelViewProjectionMatrix * float4(in.position, 1.0);
+// 2. Định nghĩa Uniform cho từng Instance (từng hình chóp)
+struct GeometryInstanceUniforms {
+    float4x4 mvpMatrix;
+};
+
+struct GeometryUniforms {
+    float4x4 mvpMatrix;
+};
+
+vertex GeometryVertexOut geometryVertex(GeometryVertexIn in [[stage_in]],
+                                        constant GeometryInstanceUniforms *instances [[buffer(1)]],
+                                        uint instanceID [[instance_id]]) {
+    GeometryVertexOut out;
+    // Lấy matrix tương ứng với hình chóp đang vẽ dựa vào ID
+    float4x4 mvp = instances[instanceID].mvpMatrix;
+    out.position = mvp * float4(in.position, 1.0);
     out.color = in.color;
     return out;
 }
 
-// Fragment Function
-fragment float4 simpleFragment(SimpleVertexOutput in [[stage_in]]) {
-    // Trả về màu đã bao gồm alpha 0.4
+fragment float4 geometryFragment(GeometryVertexOut in [[stage_in]]) {
     return in.color;
 }

@@ -141,16 +141,14 @@ final class Renderer {
         }
     }
     
-    // THÊM: Metal objects và Buffer cho Hình Chóp Camera
-    private lazy var cameraFrustumPipelineState = try! makeCameraFrustumPipelineState()
-    private lazy var cameraFrustumVertices: [SimpleVertex] = Self.createCameraFrustumVertices()
-    private lazy var cameraFrustumVertexBuffer: MetalBuffer<SimpleVertex> = .init(
-        device: device,
-        array: cameraFrustumVertices,
-        index: 5, // Giả sử một index mới
-        options: []
-    )
-    private var simpleUniformsBuffers = [MetalBuffer<SimpleUniforms>]() // Buffer cho ma trận
+    // MARK: cho Hình Chóp Camera
+    // Mảng lưu lịch sử vị trí Camera (Lưu Model Matrix)
+    private var cameraHistoryTransforms: [matrix_float4x4] = []
+    // Giới hạn số lượng hình chóp để tránh crash bộ nhớ nếu chạy quá lâu
+    private let maxPyramids = 500
+    private var pyramidPipelineState: MTLRenderPipelineState!
+    private var pyramidVertexBuffer: MTLBuffer!
+    private var pyramidVertexCount: Int = 0
     
     // MARK: - Public Rotation Function
         
@@ -179,7 +177,11 @@ final class Renderer {
         scaleFactor *= scaleDelta
     }
     
-    init(session: ARSession, metalDevice device: MTLDevice, renderDestination: MTKView) {
+    init(
+        session: ARSession,
+        metalDevice device: MTLDevice,
+        renderDestination: MTKView
+    ) {
         self.session = session
         self.device = device
         self.renderDestination = renderDestination
@@ -191,8 +193,6 @@ final class Renderer {
         for _ in 0 ..< maxInFlightBuffers {
             rgbUniformsBuffers.append(.init(device: device, count: 1, index: 0))
             pointCloudUniformsBuffers.append(.init(device: device, count: 1, index: kPointCloudUniforms.rawValue))
-            // THÊM: Buffer cho SimpleUniforms (camera frustum)
-            simpleUniformsBuffers.append(.init(device: device, count: 1, index: 4))
         }
         particlesBuffer = .init(device: device, count: maxPoints, index: kParticleUniforms.rawValue)
         
@@ -207,6 +207,10 @@ final class Renderer {
         depthStencilState = device.makeDepthStencilState(descriptor: depthStateDescriptor)!
         
         inFlightSemaphore = DispatchSemaphore(value: maxInFlightBuffers)
+        
+        // MARK: THÊM MỚI: KHỞI TẠO PYRAMID ---
+        pyramidPipelineState = makeGeometryPipelineState()
+        (pyramidVertexBuffer, pyramidVertexCount) = makePyramidBuffer()
     }
     
     func drawRectResized(size: CGSize) {
@@ -267,37 +271,19 @@ final class Renderer {
     }
     
     func draw() {
-        guard let frame = session.currentFrame else {
-            return
-        }
-        let fps: Int = session.configuration?.videoFormat.framesPerSecond ?? 0
-        
-        guard let lastFrameCache = ImageProcessor.shared.lastFrameCache, let lastFrame = lastFrameCache.frame else {
-            ImageProcessor.shared.lastFrameCache = FrameCache(0, frame, fps)
+        guard let currentFrame = session.currentFrame else {
             return
         }
         
-        let distance = overlapCalculator.calculateDynamicDistance(frame.sceneDepth?.depthMap)
-        let pointsCount = frame.rawFeaturePoints?.points.count ?? 0
-
-        let overlapRatio: CGFloat
-        if pointsCount <= 250 {
-            overlapRatio = overlapCalculator.calculateFromFov(lastFrame, frame, distance)
-        } else {
-            overlapRatio = overlapCalculator.calculateFromFeaturePoints(lastFrame, frame, distance)
-        }
-        //print("Frank overlapRatio: \(overlapRatio)")
-        if overlapRatio > 0.9 {
-            return
-        }
-        
-        guard let currentFrame = session.currentFrame,
-              let renderDescriptor = renderDestination.currentRenderPassDescriptor,
+        // 1. CHUYỂN VIỆC TẠO COMMAND BUFFER LÊN ĐẦU
+        // Chúng ta cần vẽ mỗi frame bất kể camera có di chuyển hay không (để update xoay/zoom)
+        guard let renderDescriptor = renderDestination.currentRenderPassDescriptor,
               let commandBuffer = commandQueue.makeCommandBuffer(),
               let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderDescriptor) else {
             return
         }
         
+        // Xử lý semaphore để đồng bộ CPU/GPU
         _ = inFlightSemaphore.wait(timeout: DispatchTime.distantFuture)
         commandBuffer.addCompletedHandler { [weak self] commandBuffer in
             if let self = self {
@@ -305,40 +291,57 @@ final class Renderer {
             }
         }
         
-        // update frame data
+        // 2. CẬP NHẬT DỮ LIỆU FRAME (Bao gồm cả ma trận xoay/zoom của user)
+        // Hàm này tính toán pointCloudUniforms.viewProjectionMatrix dựa trên rotation/scale hiện tại
         update(frame: currentFrame)
         updateCapturedImageTextures(frame: currentFrame)
         
-        // handle buffer rotating
+        // Cập nhật buffer index
         currentBufferIndex = (currentBufferIndex + 1) % maxInFlightBuffers
         pointCloudUniformsBuffers[currentBufferIndex][0] = pointCloudUniforms
         
-        if shouldAccumulate(frame: currentFrame), updateDepthTextures(frame: currentFrame) {
-            //print("Frank shouldAccumulate called: \(currentFrame.rawFeaturePoints?.points.count)")
+        // 3. TÍNH TOÁN OVERLAP (Logic cũ)
+        var shouldAccumulatePoints = false
+        
+        // Kiểm tra cache frame cũ để tính overlap
+        if let lastFrameCache = ImageProcessor.shared.lastFrameCache, let lastFrame = lastFrameCache.frame {
+            let distance = overlapCalculator.calculateDynamicDistance(currentFrame.sceneDepth?.depthMap)
+            let pointsCount = currentFrame.rawFeaturePoints?.points.count ?? 0
+            
+            let overlapRatio: CGFloat
+            if pointsCount <= 250 {
+                overlapRatio = overlapCalculator.calculateFromFov(lastFrame, currentFrame, distance)
+            } else {
+                overlapRatio = overlapCalculator.calculateFromFeaturePoints(lastFrame, currentFrame, distance)
+            }
+            
+            // Logic mới: Chỉ đánh dấu flag là false, KHÔNG return hàm draw
+            if overlapRatio <= 0.9 {
+                shouldAccumulatePoints = true
+            }
+        } else {
+            // Nếu chưa có lastFrame (frame đầu tiên), luôn accumulate
+            let fps: Int = session.configuration?.videoFormat.framesPerSecond ?? 0
+            ImageProcessor.shared.lastFrameCache = FrameCache(0, currentFrame, fps)
+            shouldAccumulatePoints = true
+        }
+
+        // 4. THỰC HIỆN TÍCH LŨY ĐIỂM (Chỉ khi đủ điều kiện)
+        // Kết hợp điều kiện shouldAccumulate (của hệ thống) và overlap (của thuật toán)
+        if shouldAccumulatePoints,
+           shouldAccumulate(frame: currentFrame),
+           updateDepthTextures(frame: currentFrame) {
+            
             accumulatePoints(frame: currentFrame, commandBuffer: commandBuffer, renderEncoder: renderEncoder)
             
-//            if (checkSamplingRate()) {
-//                // save selected data to disk if not dropped
-//                autoreleasepool {
-//                    // selected data are deep copied into custom struct to release currentFrame
-//                    // if not, the pools of memory reserved for ARFrame will be full and later frames will be dropped
-//                    let data = ARFrameDataPack(
-//                        timestamp: currentFrame.timestamp,
-//                        cameraTransform: currentFrame.camera.transform,
-//                        cameraEulerAngles: currentFrame.camera.eulerAngles,
-//                        depthMap: duplicatePixelBuffer(input: currentFrame.sceneDepth!.depthMap),
-//                        smoothedDepthMap: duplicatePixelBuffer(input: currentFrame.smoothedSceneDepth!.depthMap),
-//                        confidenceMap: duplicatePixelBuffer(input: currentFrame.sceneDepth!.confidenceMap!),
-//                        capturedImage: duplicatePixelBuffer(input: currentFrame.capturedImage),
-//                        localToWorld: pointCloudUniforms.localToWorld,
-//                        cameraIntrinsicsInversed: pointCloudUniforms.cameraIntrinsicsInversed
-//                    )
-//                    saveData(frame: data)
-//                }
-//            }
+            // Cập nhật lại cache sau khi đã accumulate thành công
+            let fps: Int = session.configuration?.videoFormat.framesPerSecond ?? 0
+            ImageProcessor.shared.lastFrameCache = FrameCache(0, currentFrame, fps)
         }
         
-        // check and render rgb camera image
+        // 5. VẼ (RENDER) - PHẦN NÀY LUÔN CHẠY
+        
+        // A. Vẽ nền Camera RGB
         if rgbUniforms.radius > 0 {
             var retainingTextures = [capturedImageTextureY, capturedImageTextureCbCr]
             commandBuffer.addCompletedHandler { buffer in
@@ -355,58 +358,58 @@ final class Renderer {
             renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         }
         
-        // render particles
+        // B. Vẽ Point Cloud (Particles)
+        // Vì update(frame:) đã chạy ở trên, viewProjectionMatrix đã bao gồm rotation/zoom mới nhất
         renderEncoder.setDepthStencilState(depthStencilState)
         renderEncoder.setRenderPipelineState(particlePipelineState)
         renderEncoder.setVertexBuffer(pointCloudUniformsBuffers[currentBufferIndex])
         renderEncoder.setVertexBuffer(particlesBuffer)
         renderEncoder.drawPrimitives(type: .point, vertexStart: 0, vertexCount: currentPointCount)
         
-        // --- THÊM: VẼ HÌNH CHÓP CAMERA FRUSTUM ---
-                
-        // 1. Tính toán Model-View-Projection Matrix cho hình chóp
-        
-        // Lấy ma trận View-Projection * Rotation * Scale từ hàm update (chỉ Projection * View * UserRotation * Scale)
-        let viewProjectionMatrix = pointCloudUniforms.viewProjectionMatrix
-        
-        // Lấy Model Matrix (World Matrix) của camera AR
-        let cameraWorldTransform = currentFrame.camera.transform
-        
-        // ModelViewProjection = ViewProjectionMatrix * ModelMatrix
-        let cameraFrustumModelViewProjectionMatrix = viewProjectionMatrix * cameraWorldTransform
-        
-        var simpleUniforms = SimpleUniforms(modelViewProjectionMatrix: cameraFrustumModelViewProjectionMatrix)
-        simpleUniformsBuffers[currentBufferIndex][0] = simpleUniforms
-        
-        // 2. Thiết lập Render State và Vẽ
-        
-        // Tắt Depth Write nhưng vẫn dùng Depth Test để hình chóp trong suốt không che mất các điểm gần hơn.
-        let frustumDepthStateDescriptor = MTLDepthStencilDescriptor()
-        frustumDepthStateDescriptor.depthCompareFunction = .lessEqual
-        frustumDepthStateDescriptor.isDepthWriteEnabled = false // KHÔNG ghi depth
-        let frustumDepthStencilState = device.makeDepthStencilState(descriptor: frustumDepthStateDescriptor)!
-        
-        renderEncoder.setDepthStencilState(frustumDepthStencilState)
-        if let cameraFrustumPipelineState = self.cameraFrustumPipelineState {
-            renderEncoder.setRenderPipelineState(cameraFrustumPipelineState)
+        // C. Vẽ Hình Chóp (Pyramids Trail)
+        if let pyramidPipeline = pyramidPipelineState,
+           let pyramidBuffer = pyramidVertexBuffer,
+           !cameraHistoryTransforms.isEmpty {
+            
+            let viewProjMatrix = pointCloudUniforms.viewProjectionMatrix
+            
+            var mvpMatrices: [matrix_float4x4] = []
+            mvpMatrices.reserveCapacity(cameraHistoryTransforms.count + 1)
+            
+            for oldTransform in cameraHistoryTransforms {
+                let mvp = viewProjMatrix * oldTransform
+                mvpMatrices.append(mvp)
+            }
+            
+            if let currentCamTransform = session.currentFrame?.camera.transform {
+                let currentMVP = viewProjMatrix * currentCamTransform
+                mvpMatrices.append(currentMVP)
+            }
+            
+            let instanceCount = mvpMatrices.count
+            
+            renderEncoder.pushDebugGroup("Draw Pyramids Trail")
+            renderEncoder.setRenderPipelineState(pyramidPipeline)
+            renderEncoder.setDepthStencilState(depthStencilState)
+            
+            renderEncoder.setVertexBuffer(pyramidBuffer, offset: 0, index: 0)
+            
+            let mvpBufferSize = mvpMatrices.count * MemoryLayout<matrix_float4x4>.stride
+            if let instanceBuffer = device.makeBuffer(bytes: mvpMatrices, length: mvpBufferSize, options: []) {
+                renderEncoder.setVertexBuffer(instanceBuffer, offset: 0, index: 1)
+                renderEncoder.drawPrimitives(type: .triangle,
+                                           vertexStart: 0,
+                                           vertexCount: pyramidVertexCount,
+                                           instanceCount: instanceCount)
+            }
+            
+            renderEncoder.popDebugGroup()
         }
         
-        // Cài đặt Vertex Buffer (Uniforms và Vertices)
-        //renderEncoder.setVertexBuffer(simpleUniformsBuffers[currentBufferIndex], offset: 0, index: 4)
-        renderEncoder.setVertexBuffer(simpleUniformsBuffers[currentBufferIndex].buffer, offset: 0, index: 4)
-        //renderEncoder.setVertexBuffer(cameraFrustumVertexBuffer, offset: 0, index: 5)
-        renderEncoder.setVertexBuffer(cameraFrustumVertexBuffer.buffer, offset: 0, index: 5)
-        
-        // Vẽ 4 mặt (mỗi mặt 3 vertices)
-        renderEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: cameraFrustumVertices.count)
-        
-        // ----------------------------------------------
-        
+        // Kết thúc và gửi lệnh GPU
         renderEncoder.endEncoding()
-        
         commandBuffer.present(renderDestination.currentDrawable!)
         commandBuffer.commit()
-        //print(("Frank draw point cloud called: \(currentPointCount)"))
     }
 
     // MARK: - Point cloud snapshot API
@@ -534,8 +537,22 @@ final class Renderer {
         return currentFrameIndex % pickFrames == 0
     }
     
-    private func accumulatePoints(frame: ARFrame, commandBuffer: MTLCommandBuffer, renderEncoder: MTLRenderCommandEncoder) {
+    private func accumulatePoints(
+        frame: ARFrame,
+        commandBuffer: MTLCommandBuffer,
+        renderEncoder: MTLRenderCommandEncoder
+    ) {
         pointCloudUniforms.pointCloudCurrentIndex = Int32(currentPointIndex)
+        
+        // --- THÊM MỚI: LƯU VỊ TRÍ CAMERA VÀO LỊCH SỬ ---
+        if cameraHistoryTransforms.count < maxPyramids {
+            cameraHistoryTransforms.append(frame.camera.transform)
+        } else {
+            // Nếu đầy, xóa cái cũ nhất để thêm cái mới (FIFO)
+            cameraHistoryTransforms.removeFirst()
+            cameraHistoryTransforms.append(frame.camera.transform)
+        }
+        // -----------------------------------------------
         
         var retainingTextures = [capturedImageTextureY, capturedImageTextureCbCr, depthTexture, confidenceTexture]
         commandBuffer.addCompletedHandler { buffer in
@@ -556,6 +573,83 @@ final class Renderer {
         currentPointIndex = (currentPointIndex + gridPointsBuffer.count) % maxPoints
         currentPointCount = min(currentPointCount + gridPointsBuffer.count, maxPoints)
         lastCameraTransform = frame.camera.transform
+    }
+    
+    // MARK: Function for Pỷamis shape
+    // --- THÊM MỚI: TẠO PIPELINE CHO HÌNH KHỐI ---
+    func makeGeometryPipelineState() -> MTLRenderPipelineState? {
+        guard let vertexFunction = library.makeFunction(name: "geometryVertex"),
+              let fragmentFunction = library.makeFunction(name: "geometryFragment") else {
+            return nil
+        }
+        
+        let descriptor = MTLRenderPipelineDescriptor()
+        descriptor.vertexFunction = vertexFunction
+        descriptor.fragmentFunction = fragmentFunction
+        descriptor.depthAttachmentPixelFormat = renderDestination.depthStencilPixelFormat
+        descriptor.colorAttachments[0].pixelFormat = renderDestination.colorPixelFormat
+        
+        // Cấu hình Blending để hỗ trợ độ trong suốt (Alpha = 0.4)
+        descriptor.colorAttachments[0].isBlendingEnabled = true
+        descriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        descriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        descriptor.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+        descriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        
+        // Định nghĩa layout vertex
+        let vertexDescriptor = MTLVertexDescriptor()
+        // Position
+        vertexDescriptor.attributes[0].format = .float3
+        vertexDescriptor.attributes[0].offset = 0
+        vertexDescriptor.attributes[0].bufferIndex = 0
+        // Color
+        vertexDescriptor.attributes[1].format = .float4
+        vertexDescriptor.attributes[1].offset = MemoryLayout<SIMD3<Float>>.stride
+        vertexDescriptor.attributes[1].bufferIndex = 0
+        
+        vertexDescriptor.layouts[0].stride = MemoryLayout<SimpleVertex>.stride
+        
+        descriptor.vertexDescriptor = vertexDescriptor
+        
+        return try? device.makeRenderPipelineState(descriptor: descriptor)
+    }
+
+    // --- THÊM MỚI: TẠO DỮ LIỆU HÌNH CHÓP ---
+    func makePyramidBuffer() -> (MTLBuffer?, Int) {
+        // Màu xanh, alpha 0.4
+        let color = SIMD4<Float>(0, 0, 1, 0.4)
+        
+        // Kích thước hình chóp (đơn vị mét)
+        let w: Float = 0.05 // width
+        let h: Float = 0.05 // height
+        let d: Float = 0.15 // depth (độ dài chóp)
+        
+        // Đỉnh chóp tại (0,0,0) - Tương ứng vị trí Camera
+        let apex = SIMD3<Float>(0, 0, 0)
+        
+        // 4 đỉnh đáy (nằm về phía trước camera, ARKit camera nhìn về hướng -Z)
+        let v0 = SIMD3<Float>(-w, -h, -d)
+        let v1 = SIMD3<Float>( w, -h, -d)
+        let v2 = SIMD3<Float>( w,  h, -d)
+        let v3 = SIMD3<Float>(-w,  h, -d)
+        
+        // Tạo các tam giác (Vertices)
+        let vertices: [SimpleVertex] = [
+            // Mặt bên 1
+            SimpleVertex(position: apex, color: color), SimpleVertex(position: v0, color: color), SimpleVertex(position: v1, color: color),
+            // Mặt bên 2
+            SimpleVertex(position: apex, color: color), SimpleVertex(position: v1, color: color), SimpleVertex(position: v2, color: color),
+            // Mặt bên 3
+            SimpleVertex(position: apex, color: color), SimpleVertex(position: v2, color: color), SimpleVertex(position: v3, color: color),
+            // Mặt bên 4
+            SimpleVertex(position: apex, color: color), SimpleVertex(position: v3, color: color), SimpleVertex(position: v0, color: color),
+            // Đáy (vẽ bằng 2 tam giác)
+            SimpleVertex(position: v0, color: color), SimpleVertex(position: v2, color: color), SimpleVertex(position: v1, color: color),
+            SimpleVertex(position: v0, color: color), SimpleVertex(position: v3, color: color), SimpleVertex(position: v2, color: color)
+        ]
+        
+        let buffer = device.makeBuffer(bytes: vertices, length: vertices.count * MemoryLayout<SimpleVertex>.stride, options: [])
+        return (buffer, vertices.count)
     }
 }
 
